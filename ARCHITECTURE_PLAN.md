@@ -1,332 +1,365 @@
 # Enterprise IdP — Architecture & Implementation Plan
-**For:** Top Indian Bank — Retail, Corporate/Wealth, and Internal (Employee) IAM
+**For:** Top Indian bank — Retail, Employee, Corporate/B2B, Fintech-Partner, Vendor/Merchant/NTB IAM
 **Source requirements:** `Enterprise_IdP_Blueprint.md`
-**Architectural precedent:** Ory Kratos, WSO2 Identity Server, Ping Identity (PingFederate/PingOne), Keycloak, Ory Hydra (auth-delegation pattern)
-**Status:** Decisions locked (§1) — architecture reflects sign-off
+**Live infra (not precedent — actually running):** Ory Hydra (OAuth2/OIDC, on CockroachDB), Permify (ReBAC authorization), Ory Kratos (legacy internal identity store, being migrated off)
+**Research basis:** 110-agent deep-research pass, 27 primary/secondary sources fetched, 25 claims adversarially verified (23 confirmed 3-0 or 2-1, 2 explicitly refuted and excluded — see §11). Full citations in §12.
 
 ---
 
-## 0. How to read this document
+## 0. How this document differs from the previous plan
 
-Every non-trivial design choice below cites which battle-tested IdP it's modeled on and why, plus a primary-source link. Where the frameworks disagree (they often do), §1 calls out the fork explicitly instead of silently picking a side.
+The version of this file previously committed (`git show HEAD:ARCHITECTURE_PLAN.md`, commit `4ccad2a`) locked in a decision that **this IdP does not mint OAuth2 tokens; a separate in-house Authorization Server does, modeled on Hydra's login-delegation pattern.** That assumption is now void: **Hydra itself is the live AS.** Every place the old plan said "the bank's in-house AS," read "Ory Hydra." The Auth-Delegate Adapter concept collapses into "the Identity Service *is* Hydra's login/consent provider" — one fewer integration hop, one fewer thing to keep in sync.
 
----
-
-## 1. Decisions — locked
-
-### 1.1 Build approach — **Custom build, patterns borrowed from OSS IdPs**
-Bespoke services, but data models/flow engines copy proven designs from Kratos/Keycloak/WSO2/Ping rather than reinventing them. Rationale: the blueprint's hardest requirements — India-only data residency, tamper-evident WORM audit trails, synchronous core-banking/e-KYC callouts — are exactly where OSS/commercial IdPs are least flexible. Borrowing their data models de-risks the parts that are genuinely solved problems (credential storage, flow state machines) without inheriting their constraints on the parts that aren't.
-
-### 1.2 Primary tech stack — **Go**
-Matches Ory Kratos's own stack: stateless-by-default services, trivial horizontal scaling ("just spin up another container" — [ory.com/docs/kratos/guides/production](https://www.ory.com/docs/kratos/guides/production)), low memory footprint per instance, strong concurrency primitives for the fan-out to MFA providers/risk predictors/webhooks that every login touches. Standardize on `net/http` + a thin router (chi/echo), `pgx` for Postgres, `go-redis`, and `sigs.k8s.io` tooling for k8s-native deployment.
-
-### 1.3 Multi-tenant isolation model
-- **Retail / Wealth tenants:** shared schema, `tenant_id` column on every table + **Postgres Row-Level Security (RLS)** as defense-in-depth beneath API-Gateway RBAC/ABAC — mirrors WSO2 IS's `TENANT_ID`-column model ([is.docs.wso2.com — multitenancy](https://is.docs.wso2.com/en/6.1.0/references/concepts/introduction-to-multitenancy/)).
-- **Corporate/high-compliance tenants AND Internal (Employee) IAM:** dedicated Postgres **schema-per-tenant** within the same cluster — closer to Keycloak's realm boundary ([keycloak.org — core concepts](https://www.keycloak.org/docs/latest/server_admin/index.html#core-concepts-and-terms)). Employee IAM is treated as a high-compliance tenant by default: it's the blast-radius-critical tenant, since compromise there means access to admin tooling across every other tenant.
-- **Sub-tenant grouping** (branches, business units within a corporate tenant): modeled as **Populations**/**Groups** (PingOne's term), not new tenants — a user belongs to exactly one population but many groups ([docs.pingidentity.com — groups vs populations](https://docs.pingidentity.com/pingone/directory/p1_groups_vs_populations.html)). Avoids tenant-count explosion.
-
-### 1.4 OAuth2 token issuance — **delegated to the bank's existing in-house Authorization Server**
-The bank already operates an in-house OAuth2/OIDC Authorization Server that provisions access/refresh tokens for apps enterprise-wide. This new IdP does **not** duplicate that — it does not mint OAuth2 access/refresh tokens, does not manage `oauth_client` registrations, and does not run a JWKS/introspection/revocation endpoint for app-facing tokens. Instead, this IdP becomes the **authentication backend behind** the existing AS.
-
-This is exactly the split Ory uses between **Hydra** (OAuth2/OIDC AS, "without user management... connects to any existing identity provider through a login and consent app" — [github.com/ory/hydra](https://github.com/ory/hydra)) and **Kratos** (identity/credentials/MFA). Hydra's documented contract ([ory.com/docs/oauth2-oidc/custom-login-consent/flow](https://www.ory.com/docs/oauth2-oidc/custom-login-consent/flow)):
-1. AS redirects the browser to the login provider with an opaque `login_challenge`.
-2. Login provider authenticates the user via its own mechanism (here: our Auth/Flow Service — password/OTP/MFA/step-up).
-3. Login provider calls the AS's admin API to **accept** (`subject`, `acr`, `remember`, `remember_for`, `context`) or **reject** the login request; browser is redirected back to the AS with a verifier.
-4. AS proceeds to its own consent step and mints tokens itself.
-
-**Our IdP implements the login-provider side of this contract** against the bank's specific in-house AS (its actual challenge/accept/reject API shape will differ from Hydra's — see §3.6 for the adapter design that isolates that difference). We keep our own `session`/AAL model (§4.4) for our own SSO/step-up UX, and surface `acr` (derived from AAL) to the AS on accept — but the AS, not us, is the source of truth for app-facing OAuth2 tokens.
+Second correction: the old plan chose Postgres with RLS / schema-per-tenant for isolation, modeled on WSO2/Keycloak. This plan aligns isolation with **Permify's own verified pattern** (shared instance, row-level `tenant_id`) to avoid a mismatched isolation model between the IdP and the authorization engine it depends on, and targets **CockroachDB** (not Postgres) so the IdP's data layer, Hydra's data layer, and Permify's data layer can share one HA cluster.
 
 ---
 
-## 2. Reference architecture — requirement → precedent → design choice
-
-| Blueprint requirement | Precedent it's modeled on | Design choice |
-|---|---|---|
-| Passwordless/biometric-first login, password fallback | Ory Kratos self-service flows ([ory.com/docs/kratos/self-service](https://www.ory.com/docs/kratos/self-service)) | Flow-state-machine login (§3.2), method priority ordered per tenant policy |
-| MFA: SMS/Email OTP, TOTP, FIDO2/WebAuthn | Kratos `CredentialsType` enum incl. `webauthn`, `totp`, `code`, `lookup_secret` ([github.com/ory/kratos — credentials.go](https://github.com/ory/kratos/blob/master/identity/credentials.go)); Keycloak `CREDENTIAL` table pattern | Credential table keyed by `(identity_id, type)`, §4.2 |
-| Contextual/step-up auth on risk signals | Keycloak conditional authentication sub-flows ([keycloak flows doc](https://github.com/keycloak/keycloak/blob/main/docs/documentation/server_admin/topics/authentication/flows.adoc)); PingOne Protect risk predictors + mitigation rules ([docs.pingidentity.com — risk evaluations](https://docs.pingidentity.com/pingone/threat_protection_using_pingone_protect/p1_protect_risk_evaluations.html)); WSO2 adaptive-auth scripting ([is.docs.wso2.com — adaptive auth JS API](https://is.docs.wso2.com/en/6.0.0/references/adaptive-authentication-js-api-reference/)) | Policy-as-data flow tree (REQUIRED/ALTERNATIVE/CONDITIONAL executions) + externally-scored risk engine, §3.4 |
-| Federating a corporate tenant's own Azure AD | Keycloak Identity Brokering (distinct from User Federation) ([keycloak — identity brokering](https://www.keycloak.org/docs/latest/server_admin/index.html)); WSO2 Federated Authenticator + IdP config object with claim mapping ([is.docs.wso2.com — federated authenticator](https://is.docs.wso2.com/en/6.0.0/guides/identity-federation/federated-authenticator/)) | Per-tenant `identity_provider` config row, protocol adapter pattern, §3.5 |
-| Session store with immediate invalidation | Kratos session model (`active`, `expires_at`, `authenticator_assurance_level`, `devices[]`) ([ory.com/docs/kratos/session-management](https://www.ory.com/docs/kratos/session-management/overview)); Keycloak Infinispan session caches | Redis-backed session, AAL field, §4.3 |
-| Custom IdP per corporate tenant, SAML2 for legacy apps | PingFederate IdP/SP connections + protocol-per-connection model ([docs.pingidentity.com — IdP connections](https://docs.pingidentity.com/pingfederate/13.0/administrators_reference_guide/pf_manag_idp_connect.html)) | Federation Service supports SAML2 + OIDC concurrently, §3.5 |
-| OAuth2 token issuance owned by an existing enterprise AS; this IdP only authenticates users | Ory Hydra login_challenge/consent_challenge delegation — Hydra explicitly ships "without user management," delegating to an external login provider ([github.com/ory/hydra](https://github.com/ory/hydra), [flow docs](https://www.ory.com/docs/oauth2-oidc/custom-login-consent/flow)) | Auth-Delegate Adapter implements the login-provider side of the bank's in-house AS's challenge contract, §3.6 |
-| Extensibility hooks to core banking/SMS gateway | Kratos before/after webhooks with blocking 4xx-abort semantics ([ory.com/docs/kratos/hooks](https://www.ory.com/docs/kratos/hooks/configure-hooks)); PingOne DaVinci Flow Conductor async callout ([docs.pingidentity.com — flow conductor](https://docs.pingidentity.com/connectors/flow_conductor_connector.html)) | Synchronous blocking webhook for KYC-gating + async Kafka event for everything else, §3.7 |
-| API-first, headless, custom bank frontend | Kratos BYOUI model, strict Public/Admin API network split ([ory.com/docs/network/kratos/intro](https://www.ory.com/docs/network/kratos/intro)) | Public API (internet-facing) / Admin API (internal-only, mTLS) split, §3.1 |
-| Claims/attributes per tenant, SCIM provisioning | WSO2 claim dialects (namespace-scoped claim URIs, store-independent) ([is.docs.wso2.com — claim dialects](https://is.docs.wso2.com/en/5.10.0/learn/configuring-claim-dialects/)) | `claim_dialect` + `claim_mapping` tables, §4.5 |
-
----
-
-## 3. Service architecture (clean/hexagonal)
-
-Each service below is internally structured as **ports-and-adapters**: a domain core (pure business rules, no framework types) behind inbound ports (REST/gRPC controllers) and outbound ports (repository interfaces, external gateway interfaces), with adapters plugged in at the edges. This is what makes "custom-build but borrow the data model" tractable — the domain core is small and testable regardless of which framework's schema inspired it.
+## 1. System context & actors
 
 ```
-                        ┌────────────────────┐
-   Internet ───────────▶│   API Gateway       │  RBAC/ABAC enforcement, rate limiting,
-                        │  (Kong/Envoy/APIM)  │  WAF, per-tenant routing
-                        └─────────┬────────────┘
-                                  │
-        ┌─────────────────────────┼──────────────────────────────┐
-        ▼                         ▼                              ▼
-┌───────────────┐        ┌────────────────┐            ┌──────────────────┐
-│ Identity Svc   │        │ Auth/Flow Svc  │            │ Federation Svc    │
-│ (traits, CRUD) │        │ (login/reg/    │            │ (SAML2/OIDC       │
-│                │        │  recovery flow │            │  broker, JIT      │
-│                │        │  state machine)│            │  provisioning)    │
-└───────┬────────┘        └───────┬────────┘            └────────┬──────────┘
-        │                         │                              │
-        ▼                         ▼                              ▼
-┌───────────────┐        ┌────────────────┐            ┌──────────────────┐
-│ Credential Svc │        │ MFA/Risk Svc   │            │ Auth-Delegate     │
-│ (password/     │        │ (TOTP/WebAuthn │            │ Adapter           │
-│  OTP/WebAuthn) │        │  /risk scoring)│            │ (speaks the       │
-│                │        │                │            │  in-house AS's    │
-└───────┬────────┘        └───────┬────────┘            │  login/consent    │
-        │                         │                     │  challenge API)   │
-        ▼                         ▼                     └────────┬──────────┘
-┌───────────────┐        ┌────────────────┐                      │
-│ Session Svc    │        │ Consent Svc    │                      ▼
-│ (Redis-backed) │        │ (DPDP consent  │            ┌──────────────────┐
-│                │        │  ledger)       │            │ Bank's existing   │
-└───────────────┘        └────────────────┘            │ in-house OAuth2/  │
-                                                          │ OIDC Authorization│
-┌───────────────┐                                        │ Server (owns app- │
-│ Audit Svc      │                                        │ facing tokens)    │
-│ (WORM, hash-   │                                        └──────────────────┘
-│  chained)      │
-└───────────────┘
-
-  Cross-cutting: Notification Gateway (SMS/Email/Push abstraction over
-  telecom/SendGrid providers) · Admin/Config Svc (tenant policy CRUD) ·
-  Kafka event bus (user.registered, login.failed, mfa.challenged, ...)
+                         ┌───────────────────────────────────────────┐
+                         │              Tenants (isolated by         │
+                         │              tenant_id, row-level)         │
+                         │                                             │
+  Retail customers ──────┼──▶ tenant_type=retail                      │
+  Employees/staff ───────┼──▶ tenant_type=employee (ex-Kratos)        │
+  Corporate/B2B ─────────┼──▶ tenant_type=corporate (+ sub-org via     │
+                         │      Permify relation hierarchy)            │
+  Fintech partners ──────┼──▶ tenant_type=partner (OAuth client-heavy) │
+  Vendors/Merchants/NTB ─┼──▶ tenant_type=vendor                      │
+                         └───────────────────────────────────────────┘
 ```
 
-### 3.1 API surface split (Kratos-derived)
-- **Public API** (internet-facing, per-tenant subdomain or path prefix): flow init/submit, `/sessions/whoami`, the login-provider endpoint the in-house AS redirects to (§3.6), and SAML SSO endpoints for legacy apps that federate directly. No OAuth2 authorize/token/userinfo endpoints here — those live on the existing in-house AS (§1.4). Rate-limited, WAF-fronted.
-- **Admin API** (internal network / mTLS only, never internet-exposed — explicit Kratos production guidance: [ory.com/docs/kratos/guides/production](https://www.ory.com/docs/kratos/guides/production)): identity CRUD, bulk import, tenant config, impersonation-for-support (fully audited).
+Each tenant type differs mainly in **policy** (session length, MFA strictness, which external provider it's wired to, OAuth client population) — not in a structurally different code path. This is what row-level tenancy buys: one flow engine, N policy sets.
 
-### 3.2 Auth/Flow Service — flow state machine (Kratos-derived)
-Flow object: `{id (UUID), tenant_id, type (login|registration|recovery|verification|settings), state, expires_at, ui.nodes[], methods_available[]}`. Client inits a flow → gets flow id + form schema → submits to flow action URL → service validates, either returns flow with field errors or completes (issues session or redirects).
+---
 
-Two flow **modes**, per Kratos's explicit browser-vs-API distinction ([ory.com/docs/kratos/self-service](https://www.ory.com/docs/kratos/self-service)): **Browser mode** (cookie + CSRF token) for server-rendered/cookie-based web; **API mode** (bearer session token, no cookie) for native mobile apps.
+## 2. Reference architecture
 
-### 3.3 Authentication policy — flow tree (Keycloak-derived)
-Per-tenant authentication policy is a **tree of executions**, each with a requirement: `REQUIRED` | `ALTERNATIVE` | `CONDITIONAL` | `DISABLED`, mirroring Keycloak's authenticator flow model ([keycloak flows doc](https://github.com/keycloak/keycloak/blob/main/docs/documentation/server_admin/topics/authentication/flows.adoc)). Conditions inside a `CONDITIONAL` sub-flow are AND-ed (Keycloak's documented limitation — OR requires nested sub-flows); we adopt the same limitation rather than building a full expression engine, to keep the executor auditable.
-
-Example tree for a Retail tenant's high-value transaction step-up:
 ```
-REQUIRED: password-or-biometric
-CONDITIONAL (if risk_score >= HIGH):
-  REQUIRED: step_up_totp_or_webauthn
-CONDITIONAL (if new_device AND geo_velocity_flag):
-  REQUIRED: sms_otp_verification
+                                   ┌─────────────────────┐
+     Internet / Partner APIs ─────▶│   API Gateway / BFF  │  WAF, rate limiting,
+                                   │  (per-channel: retail│  per-tenant routing
+                                   │  app, corp portal,   │
+                                   │  employee SSO, AA/   │
+                                   │  partner API)        │
+                                   └──────────┬───────────┘
+                                              │
+              ┌───────────────────────────────┼────────────────────────────────┐
+              ▼                               ▼                                ▼
+     ┌─────────────────┐           ┌────────────────────┐            ┌──────────────────┐
+     │  Identity        │◀─────────▶│   Ory Hydra         │            │  Permify           │
+     │  Service         │  login/   │  (OAuth2/OIDC AS,   │            │  (ReBAC engine,    │
+     │  (this build)    │  consent  │  headless, no user  │            │  tenant_id-scoped  │
+     │                  │  contract │  store, cockroach:// │            │  relation tuples)  │
+     └────────┬─────────┘           │  DSN)                │            └─────────┬──────────┘
+              │                     └──────────┬───────────┘                      │
+              │                                │                                  │
+              ▼                                ▼                                  ▼
+     ┌──────────────────────────────────────────────────────────────────────────────────┐
+     │                     CockroachDB — shared multi-region HA cluster                  │
+     │   database `idp`      database `hydra`        database `permify`                  │
+     │   (identities,        (oauth2_client,          (relation_tuple,                    │
+     │   credentials refs,   consent_request,         schema_definition,                  │
+     │   sessions, tenant    flow tables — Hydra's     tenant metadata —                   │
+     │   config, audit,      own migrations)           Permify's own migrations)           │
+     │   dpdp_consent,                                                                     │
+     │   migration_state)                                                                  │
+     │   super-regions constrained to India-designated regions · REGION survival goal      │
+     └──────────────────────────────────────────────────────────────────────────────────┘
+              │
+              ▼
+     ┌──────────────────────────────────────────────────────────────────────────────────┐
+     │              External Auth-Factor & Notification Adapters (this build)             │
+     │  OTPProviderAdapter · TOTPProviderAdapter · PasskeyProviderAdapter ·                 │
+     │  NotificationProviderAdapter — each resolves, per tenant_id, to the bank's actual    │
+     │  enterprise OTP / TOTP / Passkey / Notification service. No secrets/OTP codes        │
+     │  persist inside the IdP beyond a short-lived correlation reference.                  │
+     └──────────────────────────────────────────────────────────────────────────────────┘
+
+     ┌──────────────────┐        ┌──────────────────────┐       ┌────────────────────┐
+     │  Ory Kratos        │◀─────▶│  Migration Bridge      │      │  Audit / Compliance │
+     │  (legacy, employee │ OIDC  │  (federation during   │      │  Service (WORM,     │
+     │  identities —      │ fed.  │  cutover; credential  │      │  hash-chained)      │
+     │  being retired)    │       │  import; dual-write)  │      └────────────────────┘
+     └──────────────────┘        └──────────────────────┘
 ```
 
-### 3.4 MFA/Risk Service
-- Factor types: `sms_otp`, `email_otp`, `totp`, `webauthn` (FIDO2), matching the blueprint. Modeled after PingOne's device-pairing model — a user can pair **multiple devices**, and policy chooses default-device vs user-selects ([docs.pingidentity.com — manage devices](https://docs.pingidentity.com/pingone/directory/p1_manage_a_users_devices.html)).
-- Risk scoring: pluggable predictors (new-device, geo-velocity, IP reputation, transaction-value threshold) each scored, aggregated into Low/Medium/High — directly modeled on PingOne Protect's predictor→score→risk-level pipeline ([docs.pingidentity.com — risk policy](https://docs.pingidentity.com/pingone/threat_protection_using_pingone_protect/p1_protect_adding_risk_policy.html)). Mitigation rules evaluate top-to-bottom, first match wins.
-- WebAuthn/FIDO2 per W3C spec ([w3.org/TR/webauthn-3](https://www.w3.org/TR/webauthn-3/)); relying-party ID scoped per tenant custom domain.
+### Component responsibilities
 
-### 3.5 Federation Service
-- Distinguishes **User Federation** (delegate credential *validation* to external LDAP/AD, no password import) from **Identity Brokering** (bank IdP acts as SP to external OIDC/SAML IdP, e.g., a corporate tenant's Azure AD) — Keycloak's explicit distinction ([keycloak — identity brokering](https://www.keycloak.org/docs/latest/server_admin/index.html)).
-- Per-tenant `identity_provider` config: protocol, endpoints, signing certs, **claim mapping table** (external claim → internal claim URI), matching WSO2's IdP config + claim-mapping model ([is.docs.wso2.com — federated authenticator](https://is.docs.wso2.com/en/6.0.0/guides/identity-federation/federated-authenticator/)).
-- First-broker-login flow: review-profile step + account-linking-by-verified-email, per Keycloak's first-broker-login pattern ([keycloak — first login flow](https://github.com/keycloak/keycloak/blob/main/docs/documentation/server_admin/topics/identity-broker/first-login-flow.adoc)).
-
-### 3.6 Auth-Delegate Adapter (to the existing in-house Authorization Server)
-This replaces a from-scratch Token/AS Service (§1.4). The bank's existing in-house AS owns OAuth2/OIDC token issuance, JWKS, introspection, and revocation for app-facing tokens — this IdP is the **login provider** it delegates authentication to, following Ory Hydra's login_challenge/consent_challenge contract ([ory.com/docs/oauth2-oidc/custom-login-consent/flow](https://www.ory.com/docs/oauth2-oidc/custom-login-consent/flow)) as the reference shape:
-
-1. **Inbound:** the in-house AS redirects the user's browser to this IdP's public login endpoint with an opaque challenge parameter (`?login_challenge=...` in Hydra's shape — the bank's AS may name it differently). The adapter resolves the challenge against the AS's admin API to fetch context (client_id, requested scope, whether the subject is already known and login can be `skip`ped).
-2. **Runs our own flow:** the challenge is stored as correlation context on a `login_request` row (§4.6) linked to an Auth/Flow Service flow — from here it's an ordinary login/MFA/step-up flow (§3.2–3.4), independent of the AS's protocol details.
-3. **Outbound accept/reject:** on success, the adapter calls the AS's accept-login equivalent with `{subject, acr, remember, remember_for, context}` — `subject` is our `identity.id` (or a stable external-facing alias if the AS requires one), `acr` is derived from the session's AAL (§4.4: `aal1`→basic, `aal2`→MFA-verified, `aal3`→hardware-key). On failure/abandonment, it calls reject. The AS then proceeds to its own consent step and mints tokens — out of this IdP's scope entirely.
-4. **Isolating the AS's actual API shape:** because "the bank's existing in-house AS" is not Hydra and its exact challenge/accept/reject contract is bank-specific, this is built as a **port-and-adapter**: the Auth/Flow Service's domain core only knows "authentication succeeded for identity X with ACR Y, notify the delegator" — a single adapter implementation translates that into the AS's actual HTTP contract. If the AS's contract changes, only the adapter changes.
-5. **Direct SAML2 for legacy apps that don't go through the in-house AS at all** (per blueprint's SAML2-for-legacy requirement) is still served directly by the Federation Service (§3.5) acting as SAML IdP — the delegation pattern above only applies to the OAuth2/OIDC path that already flows through the existing AS.
-6. **Latency/reliability:** the accept/reject call to the AS's admin API is now a hard synchronous dependency on the critical path of every login — needs a circuit breaker, tight timeout (target <300ms p99), and a clear fallback (fail the login, don't silently retry against a state-mutating endpoint) since accept-login is not idempotent by nature (single-use challenge, per Hydra's model — [ory security architecture](https://www.ory.com/docs/hydra/security-architecture)).
-
-### 3.7 Extensibility hooks
-- **Synchronous blocking webhook** (registration/settings flows only, e.g., core-banking account-number validation, e-KYC/Aadhaar check): configured with strict timeout (recommend 5–10s, tighter than Kratos's documented ~30s default given a real-time UX budget); non-2xx response aborts the flow with structured field errors, per Kratos's webhook semantics ([ory.com/docs/guides/integrate-with-ory-cloud-through-webhooks](https://www.ory.com/docs/guides/integrate-with-ory-cloud-through-webhooks)).
-- **Async fire-and-forget** (everything else — analytics, downstream provisioning, fraud-engine notification): published to Kafka, consumed by the target system; no flow blocking.
-- **Long-running async with resume** (e.g., a document-verification step that a human reviews out-of-band): modeled on PingOne DaVinci's Flow Conductor "challenge variable" pattern — flow suspends, a callback resolves it later ([docs.pingidentity.com — flow conductor](https://docs.pingidentity.com/connectors/flow_conductor_connector.html)).
-
----
-
-## 4. Data model
-
-All tables carry `tenant_id` (except where noted as tenant-config tables themselves) and are subject to Postgres RLS. UUIDv7 recommended for primary keys (time-ordered, index-friendly, unlike UUIDv4).
-
-### 4.1 `tenant`
-| Column | Type | Notes |
+| Component | Owns | Does NOT own |
 |---|---|---|
-| `id` | UUID PK | |
-| `slug` | text unique | subdomain/path segment |
-| `type` | enum | `retail`, `wealth`, `corporate`, `internal` |
-| `isolation_tier` | enum | `shared_schema`, `dedicated_schema` |
-| `schema_name` | text nullable | set when `isolation_tier = dedicated_schema` |
-| `branding_config` | jsonb | logos, theme, email templates |
-| `password_policy` | jsonb | |
-| `session_policy` | jsonb | absolute/idle timeouts |
-| `mfa_policy_id` | FK → `mfa_policy` | |
-| `created_at`, `updated_at` | timestamptz | |
+| **Identity Service** (new build) | Identity lifecycle, flow state machines (login/registration/recovery/verification/settings), session issuance, tenant config, hook/webhook extension points, Hydra login/consent contract implementation | OAuth token minting (Hydra), authorization decisions (Permify), OTP/TOTP secret generation or Passkey ceremony crypto (external services), notification delivery (external service) |
+| **Ory Hydra** | OAuth2/OIDC token issuance, JWKS, introspection/revocation, consent-grant storage | User authentication UX, identity storage |
+| **Permify** | Relationship-based authorization decisions, tenant-scoped relation tuples, entitlement hierarchies for corporate/B2B | Identity data, session state |
+| **External OTP/TOTP/Passkey/Notification services** | Generating/verifying OTP and TOTP, WebAuthn/Passkey ceremony, delivering Email/SMS | Anything about who the user is or what they're allowed to do |
+| **Ory Kratos** (during migration only) | Source-of-truth identity for not-yet-migrated employee tenants | Nothing new — frozen scope, shrinking over time |
 
-*Precedent:* Keycloak realm (branding/password-policy/keys are realm-scoped: [keycloak core concepts](https://www.keycloak.org/docs/latest/server_admin/index.html#core-concepts-and-terms)) + WSO2 shared-schema tenant model + PingOne Organization→Environment hierarchy.
+---
 
-### 4.2 `identity`
-| Column | Type | Notes |
+## 3. Data model (CockroachDB, database `idp`)
+
+```
+tenants
+  tenant_id            UUID PK
+  tenant_type          ENUM(retail, employee, corporate, partner, vendor)
+  name                 TEXT
+  data_residency_region TEXT        -- must resolve to an India super-region
+  status               ENUM(active, suspended, migrating, decommissioning)
+  created_at           TIMESTAMPTZ
+
+tenant_config
+  tenant_id            UUID FK -> tenants
+  capability           ENUM(otp, totp, passkey, notification)
+  provider_ref         TEXT         -- logical name of the external enterprise service
+  endpoint_config      JSONB        -- non-secret routing/config
+  secret_ref           TEXT         -- pointer into KMS/secrets manager, never the secret itself
+  PRIMARY KEY (tenant_id, capability)
+
+identities
+  identity_id          UUID PK
+  tenant_id            UUID FK -> tenants   -- row-level isolation key, mandatory on every query
+  traits               JSONB        -- schema mirrors Kratos identity traits for migration compatibility
+  state                ENUM(active, inactive, migrating)
+  source_system        ENUM(native, kratos_migrated)
+  created_at           TIMESTAMPTZ
+  INDEX (tenant_id, identity_id)
+
+credentials
+  credential_id        UUID PK
+  identity_id          UUID FK -> identities
+  tenant_id            UUID          -- denormalized for isolation-check speed
+  type                 ENUM(password, otp_ref, totp_ref, passkey_ref)
+  -- password: hash + algo tag only
+  -- otp_ref / totp_ref / passkey_ref: correlation reference to the external
+  --   enterprise service; no OTP code, TOTP seed, or private key material lives here
+  external_credential_ref TEXT
+  created_at           TIMESTAMPTZ
+  updated_at           TIMESTAMPTZ
+
+sessions
+  session_id           UUID PK
+  identity_id          UUID FK -> identities
+  tenant_id            UUID
+  aal                  ENUM(aal1, aal2, aal3)   -- authenticator assurance level
+  devices              JSONB
+  expires_at           TIMESTAMPTZ
+  revoked_at           TIMESTAMPTZ NULL
+
+dpdp_consent_ledger
+  consent_id           UUID PK
+  identity_id          UUID FK -> identities
+  tenant_id            UUID
+  purpose              TEXT          -- DPDP-scoped purpose, distinct from Hydra's OAuth consent grants
+  granted_at           TIMESTAMPTZ
+  withdrawn_at         TIMESTAMPTZ NULL
+
+audit_log
+  audit_id             UUID PK
+  tenant_id            UUID
+  actor_identity_id     UUID
+  action               TEXT
+  before_state          JSONB
+  after_state           JSONB
+  hash_prev            BYTES         -- hash-chained for tamper-evidence (WORM store downstream)
+  occurred_at          TIMESTAMPTZ
+
+migration_state
+  identity_id          UUID FK -> identities
+  kratos_identity_id    UUID
+  migration_status      ENUM(not_started, credentials_imported, dual_write, cutover_complete)
+  cutover_batch         TEXT
+  updated_at           TIMESTAMPTZ
+```
+
+**Deliberate omissions:** no `oauth_client` table (that's Hydra's `hydra` database), no `relation_tuple` table (that's Permify's `permify` database), no OTP-code or TOTP-seed columns anywhere (those live only in the external enterprise services — this schema stores references, never secrets).
+
+**Permify schema sketch** (owned by Permify, shown here only to make the entitlement mapping explicit for corporate/B2B):
+```
+entity tenant {}
+entity organization {
+  relation parent @tenant
+  relation admin @identity
+  relation member @identity
+  action manage = admin
+  action view = admin or member
+}
+entity account {
+  relation owner @organization
+  action view = owner.member
+  action transact = owner.admin
+}
+```
+This is the concrete mechanism for "corporate/B2B delegated administration with complex entitlement hierarchies" — a sub-org's `member` inherits `view` on its accounts via the `owner.member` cascade, without the IdP itself modeling org charts.
+
+---
+
+## 4. Multi-tenancy isolation strategy
+
+| Layer | Mechanism | Rationale |
 |---|---|---|
-| `id` | UUID PK | immutable |
-| `tenant_id` | FK | |
-| `schema_id` | text | which JSON-Schema validates `traits` (retail-customer vs employee vs corporate-user schema) — Kratos's Identity Schema concept ([ory — identity schema](https://www.ory.com/docs/kratos/manage-identities/identity-schema)) |
-| `traits` | jsonb | self-service-editable profile (name, email, phone, DOB) — validated against `schema_id` on write |
-| `state` | enum | `active`, `suspended`, `locked`, `pending_verification` |
-| `kyc_status` | enum | `pending`, `verified`, `rejected` — bank-specific, not in any reference IdP |
-| `metadata_public` | jsonb | visible to the identity itself, not user-editable |
-| `metadata_admin` | jsonb | admin/support-only |
-| `created_at`, `updated_at` | timestamptz | |
+| Permify | Shared instance, mandatory `tenant_id` on every `Check()` call, row-level `tenant_id` on relation-tuple and schema tables | This is Permify's own documented and recommended model — not a choice this project gets to make differently without fighting the tool |
+| IdP data layer | Row-level `tenant_id` on every table, enforced at the query layer (every repository method requires a `tenant_id` argument — no "get by ID" without it) | Matches Permify's model 1:1, so there is no isolation-model seam between authentication and authorization |
+| Hydra | OAuth clients tagged with `tenant_id` in client metadata; login/consent contract carries `tenant_id` through the `login_challenge` context | Hydra itself is tenant-agnostic (it has no concept of tenants) — tenancy is layered on top via the Identity Service, which is the only thing that talks to Hydra's admin API |
+| CockroachDB | One shared cluster, separate `idp` / `hydra` / `permify` databases (not separate clusters) | Avoids running three independent HA clusters; blast-radius separation is at the database/schema level, physical HA is shared |
+| Highest-sensitivity tenants (large corporate) | **Do not** introduce a different isolation primitive (e.g. schema-per-tenant) just for these — it would diverge from Permify's model and add an inconsistency the authorization layer can't see. Instead, use tighter Permify schema-level restrictions plus additional audit-log granularity for these tenant_ids. | An open question in the research (see §11 "open questions") is whether Permify has published tenant-count/blast-radius guidance at bank scale — treat cluster-per-tenant as a fallback to revisit only if that guidance, once obtained, says row-level is insufficient for this tenant class |
 
-*Precedent:* Kratos `Identity` struct — traits vs credentials vs metadata_public/admin split ([github.com/ory/kratos/identity/identity.go](https://github.com/ory/kratos/blob/master/identity/identity.go), [ory — managing identities metadata](https://www.ory.com/docs/kratos/manage-identities/managing-users-identities-metadata)).
+### 4.1 Cross-tenant access violation defenses (the part row-level `tenant_id` alone does not solve)
 
-### 4.3 `credential`
-| Column | Type | Notes |
+Row-level `tenant_id` only isolates tenants if `tenant_id` is *trustworthy*. If any service accepts `tenant_id` as a client-supplied parameter (header, body field, query string) and filters on it directly, then knowing or guessing another tenant's ID is sufficient to read that tenant's data — this is OWASP API1:2023 Broken Object Level Authorization, at tenant granularity, and it is **not** prevented by RLS or row-level columns on their own. The defense is layered, so no single bug or omission is sufficient to leak across tenants:
+
+| Layer | Mechanism | What it stops |
 |---|---|---|
-| `id` | UUID PK | |
-| `identity_id` | FK | |
-| `type` | enum | `password`, `totp`, `webauthn`, `sms_otp`, `email_otp`, `lookup_recovery_codes`, `oidc_federated`, `saml_federated` |
-| `identifier` | text nullable | unique per `(tenant_id, type, identifier)` — e.g. email for `password`, external subject for `oidc_federated` |
-| `credential_data` | jsonb | algorithm/config (non-secret): e.g. Argon2id params, WebAuthn public key + counter |
-| `secret_data` | jsonb encrypted | hash + salt, envelope-encrypted with tenant DEK (AES-256, KMS-managed) |
-| `device_label` | text nullable | user-facing device name for WebAuthn/TOTP |
-| `created_at`, `last_used_at` | timestamptz | |
+| **1. Trust boundary at token issuance** | `tenant_id` is resolved server-side from the authenticated identity's own record and embedded as a signed claim in the Hydra-issued access/ID token. No service reads `tenant_id` from a request header, body, or query parameter — ever. The API Gateway strips/ignores any client-supplied tenant field before forwarding and injects the token-derived value. | An attacker who knows tenant B's ID cannot act as tenant B without a token whose signature proves it — i.e. without actually compromising tenant B's credentials or Hydra's signing key. This is the primary fix for "tenant_id is known." |
+| **2. Database-level backstop — CockroachDB Row-Level Security** | RLS (`ENABLE ROW LEVEL SECURITY` + `CREATE POLICY ... USING (tenant_id = current_setting('app.current_tenant')::uuid)`) on every multi-tenant table. The `app.current_tenant` session variable is set once per request from the *verified token claim*, never from a parameter. | Application-layer bugs — a missing `WHERE`, a raw/ad hoc query, an ORM footgun, a future contributor's mistake — can no longer return foreign-tenant rows, because the database enforces the filter independently of the query that was actually written. |
+| **3. Permify `Check()` as a second, independent authority** | Permify's `tenant_id` argument is likewise server-derived, never client-supplied. More importantly, `Check()` validates the *relation* between subject and resource, not just a tenant match — there is no relation tuple connecting an identity to another tenant's resources, so even a hypothetical wrong tenant_id still gets denied. | A bug that defeats layer 1 or 2 alone still has to defeat the relation graph — the three layers do not share a single point of failure. |
+| **4. Network segmentation** | CockroachDB and Permify's Check/Admin APIs are reachable only from backend services on a private network/mTLS mesh — never directly by client apps or partner integrations. | Knowing a tenant_id (or even a connection string fragment) is useless if the caller can't reach the systems that would act on it. |
+| **5. Adversarial testing as a CI gate** | Automated BOLA/IDOR-style tests on every PR touching a repository method or authorization path: forged/mismatched tenant claims, valid token + enumerated foreign resource IDs, requests that attempt to bypass the gateway and hit Permify/CockroachDB directly. | Converts "we believe isolation holds" into "isolation is checked on every change," which is what the fitness function in §8 actually requires — a manual review is not a substitute for this. |
+| **6. (Optional, for highest-sensitivity corporate/B2B tenants) Per-tenant envelope encryption** | Sensitive columns encrypted with tenant-scoped Data Encryption Keys via KMS, on top of CockroachDB's cluster-wide Encryption at Rest. | Even a catastrophic failure of layers 1–4 simultaneously (e.g. an RLS policy misconfigured during a migration) returns ciphertext unreadable without the correct tenant's key — a backstop of last resort, not a substitute for the layers above. |
 
-*Precedent:* directly modeled on Keycloak's `CredentialModel` (`credentialData`/`secretData` JSON split) ([keycloak PasswordHashProvider](https://www.keycloak.org/docs-api/latest/javadocs/org/keycloak/credential/hash/PasswordHashProvider.html)) and Kratos's `map[CredentialsType]Credentials` per-identity model ([github.com/ory/kratos/identity/credentials.go](https://github.com/ory/kratos/blob/master/identity/credentials.go)). Hashing: **Argon2id**, the Keycloak 25+ default chosen specifically for GPU/side-channel resistance ([keycloak 25 release notes](https://www.keycloak.org/2024/06/keycloak-2500-released)) — matches blueprint's Argon2id/PBKDF2 requirement directly.
+**Audit signal, not just enforcement:** log every request where a client-asserted tenant field (if one is present at all, e.g. in a legacy integration payload) disagrees with the verified token's `tenant_id` claim — even though the client-asserted value is always ignored for authorization decisions, a mismatch is a probing signal worth alerting on.
 
-### 4.4 `session`
-Primary store: **Redis** (hash per session id, TTL = absolute timeout) for immediate invalidation; async-replicated to Postgres `session_audit` (append-only) for compliance trail.
+---
 
-| Field | Notes |
-|---|---|
-| `id` | session token/cookie value |
-| `identity_id`, `tenant_id` | |
-| `aal` | `aal1` (one factor) / `aal2` (MFA) / `aal3` (hardware-key) — Kratos AAL model ([ory — session management](https://www.ory.com/docs/kratos/session-management/overview)) |
-| `authentication_methods` | list of `{method, completed_at, aal}` |
-| `issued_at`, `expires_at` (absolute), `idle_expires_at` | per-tenant policy from `tenant.session_policy` |
-| `device` | `{ip, geo, user_agent, device_fingerprint}` |
-| `revoked_at` | nullable — set on explicit logout / global-logout / admin action |
+## 5. CockroachDB HA / data-layer topology
 
-*Precedent:* Kratos session object fields ([ory — session management](https://www.ory.com/docs/kratos/session-management/overview)); Redis as the store (not Postgres-primary) is the bank blueprint's own explicit requirement, reinforced by Keycloak's use of a distributed in-memory grid (Infinispan) for the same reason ([keycloak caching](https://www.keycloak.org/server/caching)).
+- **Regions:** 3+ India-designated regions (exact cloud regions depend on the chosen provider's India footprint), enabling the `REGION` survival goal — the cluster automatically raises replication factor (2+2+1 pattern) to survive a full region loss, at a documented write-latency cost.
+- **Super-regions:** used to constrain all voting and non-voting replicas of India-resident data to the India-designated region set — this is the concrete, vendor-documented mechanism for satisfying RBI data-localization/domiciling obligations for the live cluster.
+- **Encryption at rest:** enabled cluster-wide (AES, two-tier store-key/data-key architecture).
+- **Backups — explicit gate, not optional:** CockroachDB's cluster-wide Encryption at Rest does **not** automatically encrypt `BACKUP` statement output. Every backup job for this cluster must explicitly specify an encryption key or KMS at backup time, or the RBI-regulated data in that backup is unencrypted at rest in the backup target. This must be a CI/ops gate (fail the backup job if no KMS param is present), not a documentation note.
+- **Shared cluster, separate databases:** `idp`, `hydra`, `permify` databases in one cluster — Hydra already has first-class CockroachDB support (dedicated `cockroach://` DSN and migrations), so this is a genuine code-level integration, not a compatibility hack.
+- **Row-Level Security:** CockroachDB ships stable `ENABLE ROW LEVEL SECURITY` / `CREATE POLICY` support (Postgres-compatible syntax) — used as the database-level backstop for tenant isolation described in §4.1, not as the sole isolation mechanism.
+- **Connection budgeting:** three consumers (Identity Service, Hydra, Permify) on one cluster means connection-pool sizing and query-load isolation (e.g. per-database resource limits, if the provider's CockroachDB offering supports them) must be planned before go-live, not discovered under load.
 
-### 4.5 `claim_dialect` / `claim_mapping`
-- `claim_dialect(id, tenant_id nullable, namespace_uri)` — `tenant_id null` = shared/system dialect.
-- `claim_mapping(id, identity_provider_id, external_claim, internal_claim_uri)` — used by Federation Service to translate incoming SAML/OIDC claims.
+---
 
-*Precedent:* WSO2 claim dialects — store-independent, namespace-scoped claim URIs ([is.docs.wso2.com — claim dialects](https://is.docs.wso2.com/en/5.10.0/learn/configuring-claim-dialects/)).
+## 6. Pluggable external auth-factor & notification integration
 
-### 4.6 `login_request` (correlates our flow to the in-house AS's challenge)
-| Column | Type | Notes |
+The extension mechanism is a **flow hook system**, modeled deliberately on Ory Kratos's own before/after hooks on its five self-service flows (login, registration, recovery, settings, verification) — proven pattern, and it's also the exact mechanism the Kratos migration bridge needs (see §9).
+
+```
+LoginFlow.beforeSubmit  → hook: resolve tenant_config[tenant_id][capability] → provider adapter
+LoginFlow.afterVerify   → hook: notify (async, non-blocking) via NotificationProviderAdapter
+RegistrationFlow.*      → hook: passkey enrollment via PasskeyProviderAdapter
+RecoveryFlow.*          → hook: OTP dispatch via OTPProviderAdapter, notification via NotificationProviderAdapter
+```
+
+**Adapter interfaces (conceptual, not literal code):**
+- `OTPProviderAdapter`: `generateAndSend(tenant_id, identity_id, channel)`, `verify(tenant_id, correlation_ref, code)`
+- `TOTPProviderAdapter`: `enroll(tenant_id, identity_id)`, `verify(tenant_id, correlation_ref, code)`
+- `PasskeyProviderAdapter`: `beginRegistration(tenant_id, identity_id)`, `finishRegistration(...)`, `beginAssertion(...)`, `finishAssertion(...)` — the IdP relays WebAuthn ceremony data to/from the browser but the external service performs the cryptographic verification
+- `NotificationProviderAdapter`: `send(tenant_id, identity_id, template, channel)` — Email/SMS delivery is entirely the external service's responsibility
+
+**Per-tenant resolution:** every adapter call starts by reading `tenant_config[tenant_id][capability]` to determine which concrete enterprise-service endpoint to call. A retail tenant and a corporate tenant can point at different OTP providers (or different configs of the same provider) without any code branching — only config changes.
+
+**Why this satisfies "integrate, don't rebuild":** the IdP never has an OTP-generation algorithm, a TOTP seed-derivation function, or WebAuthn attestation-verification logic of its own. If none of those adapters can reach their configured external service, the corresponding auth method fails closed — the IdP has no fallback native implementation to fall back to, by design.
+
+---
+
+## 7. Ory Kratos → new IdP migration strategy
+
+| Phase | What happens | Risk gate before proceeding |
 |---|---|---|
-| `id` | UUID PK | internal |
-| `external_login_challenge` | text | the AS-issued challenge/verifier we're resolving — single-use |
-| `tenant_id` | FK | |
-| `flow_id` | FK → Auth/Flow Service flow | drives the actual login/MFA UI |
-| `identity_id` | FK nullable | set once authenticated |
-| `acr` | text nullable | derived from session AAL at accept-time |
-| `status` | enum | `pending`, `accepted`, `rejected`, `expired` |
-| `created_at`, `completed_at` | timestamptz | |
+| **1. Schema mapping** | Map Kratos identity `traits` schema to the new `identities.traits` JSONB shape; inventory every internal system currently calling Kratos's public/admin API | None of Kratos's current internal integrations may be touched yet |
+| **2. Federation bridge** | Kratos registered as an upstream OIDC IdP federated *into* the new Identity Service (which fronts Hydra). Employees still authenticate against Kratos; Hydra still issues the eventual token. No employee-facing behavior change. | Federation bridge passes parity tests against a sample of existing employee logins |
+| **3. Credential import** | Bulk-import Kratos's pre-hashed credentials (Kratos supports 10 hash algorithms — BCrypt, Argon2, MD5, SHA variants, SSHA variants, PBKDF2, SCrypt, Firebase SCrypt, crypt(3), HMAC — via its Admin API or a migration hook) into the new IdP's `credentials` table. **No forced password reset at import time** — imported credentials bypass policy validation and are honored as-is; users are nudged to a policy-compliant credential later via self-service, not blocked. | Import job is idempotent and re-runnable; a sample of imported credentials verifies successfully against the new IdP's login flow before any batch is called complete |
+| **4. Dual-write / shadow mode** | New registrations and profile updates written to both Kratos and the new IdP; migration_state tracks parity per identity | Discrepancy rate between the two systems is monitored and must be ~zero before advancing a batch |
+| **5. Progressive cutover** | Batch-by-batch (start with lowest-risk employee cohort, e.g. new hires with no legacy Kratos history), redirect authentication traffic to the new IdP; Kratos federation bridge for that batch is turned off | Each batch's fitness-function checks (§10) pass before the next batch starts |
+| **6. Kratos freeze → decommission** | Once all batches are cut over, Kratos goes read-only for the compliance-mandated retention period, then is decommissioned | Retention period and decommission are signed off by compliance, not engineering alone |
 
-*Precedent:* directly modeled on Hydra's login_challenge/login_request object — a short-lived, single-use, opaque correlation id ([ory — custom login/consent flow](https://www.ory.com/docs/oauth2-oidc/custom-login-consent/flow)). No `oauth_client`/`refresh_token`/access-token tables exist in this schema — those are the existing in-house AS's responsibility (§1.4).
-
-### 4.7 `relying_party`
-`id, tenant_id, protocol (in_house_as_login_delegate | saml2_sp), display_name, endpoint_config jsonb (challenge-resolve URL, accept/reject URLs, trust cert/secret ref), created_at`. Represents (a) the bank's in-house AS as the primary consumer of our login-provider contract, and (b) any legacy apps that federate to us directly as a SAML2 IdP without going through the in-house AS.
-
-### 4.8 `identity_provider` (federation config, per-tenant)
-`id, tenant_id, protocol (saml2|oidc), display_name, metadata_url_or_xml, signing_cert, client_id/secret (oidc), attribute_mapping_id`.
-
-### 4.9 `consent`
-DPDP-driven: `id, identity_id, purpose_code, policy_version, granted_at, revoked_at, consent_manager_ref`. Retained per DPDP Rules 2025's consent-audit-trail requirement (Consent Managers must retain records ≥7 years — [DPDP Rules 2025](https://www.dpdpa.com/DPDP_Rules_2025_English_only.pdf)).
-
-### 4.10 `audit_log`
-Append-only, hash-chained (`prev_hash`, `record_hash`) for tamper-evidence, mirrored to WORM object storage (India region). `id, tenant_id, actor_identity_id, actor_type (user|admin|system), action, resource_type, resource_id, ip, user_agent, occurred_at, prev_hash, record_hash`. Partitioned by month for retention/archival.
-
-*Note:* no reference IdP in our research ships hash-chained WORM audit natively (Keycloak's admin-events table is a plain audit log, not tamper-evident) — this is bank-specific and must be custom-built.
-
-### 4.11 `risk_signal`
-`id, identity_id, session_id nullable, signal_type (new_device|geo_velocity|ip_reputation|txn_value), score, evaluated_at, context jsonb`. Feeds the MFA/Risk Service's mitigation-rule evaluation (§3.4).
+This phasing is the direct payoff of §6's hook architecture — the same before/after hook mechanism that plugs in external OTP/TOTP/Passkey/Notification providers is what lets the federation bridge and dual-write mode exist without forking the core flow engine.
 
 ---
 
-## 5. Multi-tenant security enforcement
+## 8. Fitness functions / non-functional requirements
 
-1. **API Gateway layer:** every request must carry a tenant-scoped access token; gateway validates `tenant_id` claim matches the target tenant's route before forwarding (RBAC/ABAC, per blueprint §3).
-2. **Service layer:** every repository call is scoped by `tenant_id` extracted from the authenticated context — never taken from a request parameter.
-3. **DB layer (defense-in-depth):** Postgres RLS policy `USING (tenant_id = current_setting('app.tenant_id')::uuid)` on every shared-schema table; the service sets `app.tenant_id` per-connection/per-transaction from the validated JWT claim, so even a bug in service-layer scoping can't leak cross-tenant rows.
-4. **Corporate dedicated-schema tenants:** additionally isolated by Postgres `search_path`/schema boundary — a compromised shared-schema query literally cannot address these tables.
+| Dimension | Target | Notes |
+|---|---|---|
+| Availability (auth path: login, token issuance) | 99.99% | Measured across Identity Service + Hydra + Permify + CockroachDB as a chain; a single-component SLA higher than the chain's SLA is not sufficient |
+| Latency | P99 login-initiation < 300ms; Permify `Check()` P99 < 50ms; OTP/TOTP/Passkey round-trip bounded by the external service's own SLA, not the IdP's | External-service latency must be contracted separately — the IdP cannot make an SLA promise on a call it doesn't control |
+| Data residency | 100% of live India-resident data replicas within India-designated CockroachDB super-regions | Verify via CockroachDB's own region-placement introspection, not just config intent |
+| Backup encryption | 100% of `BACKUP` jobs specify an explicit KMS/encryption key | Automated CI/ops check — a backup job without this parameter should fail, not warn |
+| Tenant isolation | Zero cross-tenant data return across all three independent layers (§4.1): token-claim forgery attempts, RLS-bypass attempts (query without a tenant filter, raw/ad hoc query), and Permify `Check()` denial for any cross-tenant relation probe | Run as a CI gate on every PR touching a repository method or authorization path — not a periodic manual review |
+| Credential migration | Zero forced password resets during Kratos migration; 100% of imported credentials verify against at least one live login attempt before a batch is marked complete | Directly required by the "no compromise on regulations" instruction — a forced mass reset would itself be a customer-facing incident |
+| Auditability | 100% of authentication and admin actions produce a hash-chained audit record | Sampled tamper-evidence verification on a recurring schedule |
 
----
-
-## 6. Performance & scaling strategy
-
-- **Stateless services, stateful stores.** All application services (Identity, Auth/Flow, Federation, MFA/Risk, Auth-Delegate Adapter) are horizontally scalable with no local state — session/flow state lives in Redis, everything durable lives in Postgres — following Kratos's explicit "no additional requirements for scaling... just spin up another container" model ([ory — production guide](https://www.ory.com/docs/kratos/guides/production)).
-- **Redis Cluster:** sessions, flow state (short TTL, ~15–60 min), OTP throttling counters, `login_request` correlation entries (short TTL, matching challenge expiry), per-tenant rate-limit counters.
-- **Postgres:** primary + India-region read replicas; PgBouncer connection pooling; `audit_log` and `session_audit` partitioned by month; heavy-read config/claims tables (tenant config, claim dialects) cached read-through in Redis with short TTL + explicit invalidation on admin write.
-- **Kafka:** async event bus for `user.registered`, `login.failed`, `login.succeeded`, `mfa.challenged`, `session.revoked` — decouples the hot auth path from downstream fraud-engine/SIEM/provisioning consumers, per blueprint §6.
-- **The Auth-Delegate Adapter's call to the in-house AS is now the tightest latency budget in the system** (§3.6): every login makes one synchronous outbound call to accept/reject the challenge. Mitigate with connection pooling/keep-alive to the AS, a circuit breaker (fail fast rather than queue logins behind a degraded AS), and treating that call's p99 latency as a first-class SLO metric, not an afterthought — unlike the JWT-validation path in WSO2's or Kratos's own reference architectures, this dependency can't be made DB-free because token issuance now lives outside this IdP entirely (§1.4).
-- **Multi-region active-active (Mumbai + Hyderabad, per blueprint §6):** Postgres via synchronous replication within a metro pair is too slow for write-heavy auth paths at 99.99% SLA; recommend **Patroni-managed Postgres with regional read replicas + async cross-region replication**, and route writes to the region owning that tenant's primary ("closest region" affinity per tenant), matching the WSO2 published multi-region pattern of active/passive DC pairs with DNS failover rather than synchronous cross-DC writes ([WSO2 — multi-region deployment](https://wso2.com/library/articles/2018/04/multi-region-deployment-for-wso2-identity-server-part-1/)). Redis Cluster similarly runs per-region with async replication for session data (sessions are re-derivable via token refresh on failover, so losing a few seconds of session writes on regional failover is an acceptable trade-off vs synchronous latency cost).
-- **No silent scale caps:** rate limits and connection pool sizes must be tenant-aware (a Corporate tenant's batch operations shouldn't starve Retail's login traffic) — implement via per-tenant token buckets at the gateway, not a single global limiter.
+**Explicitly not asserted:** a specific RBI-mandated RTO/RPO figure. This research pass did not verify a specific numeric DR requirement from RBI text for this system class — the bank's compliance/BCP team should supply the binding figure rather than this document inventing one.
 
 ---
 
-## 7. Standards & compliance mapping
+## 9. Phased implementation roadmap (for AI-coder execution)
 
-| Area | Standard/Regulation | Citation | Design response |
-|---|---|---|---|
-| Federation | OAuth 2.0 / OIDC Core | RFC 6749; openid.net/specs | Owned by the bank's existing in-house AS; this IdP is its login-provider delegate — Auth-Delegate Adapter, §3.6 |
-| Federation | SAML 2.0 | OASIS SAML 2.0 Core | Federation Service, §3.5 |
-| MFA hardware/biometric | FIDO2/WebAuthn | [W3C WebAuthn Level 3](https://www.w3.org/TR/webauthn-3/) | MFA/Risk Service, §3.4 |
-| Password hashing | Argon2id | Keycloak 25+ default, chosen for GPU/side-channel resistance ([keycloak 2500 release](https://www.keycloak.org/2024/06/keycloak-2500-released)) | `credential.secret_data`, §4.3 |
-| MFA for payments | RBI Master Direction on Digital Payment Security Controls, 2021 — dynamic/non-replicable factor requirement | [rbidocs.rbi.org.in MD](https://rbidocs.rbi.org.in/rdocs/notification/PDFs/MD7493544C24B5FC47D0AB12798C61CDB56F.PDF) | Step-up policy tree, §3.3 |
-| Session timeout | Same MD, §52 — auto-terminate on inactivity | same | `tenant.session_policy.idle_timeout`, §4.4 |
-| First-login password change | Same MD, §53 | same | forced-rotation flag on `credential` |
-| Fraud/anomaly monitoring | Same MD, §37 — geo/IP/velocity/behavioral monitoring | same | `risk_signal` table + MFA/Risk Service, §4.11 |
-| Cipher/key strength | RBI Master Direction on IT Governance, 2023 | [rbi.org.in MD IT Governance](https://www.rbi.org.in/Scripts/BS_ViewMasDirections.aspx?id=12562) | TLS 1.3-only, RS256/ES256 signing (no deprecated algs) |
-| Incident reporting to CERT-In/RBI | Same MD, Ch. IV §27; Cyber Security Framework for Banks 2016 | [rbi.org.in circular NT41802062016](https://www.rbi.org.in/commonman/Upload/English/Notification/PDFs/NT41802062016.pdf) | Audit Svc → SIEM pipeline, §3, plus incident-runbook (ops concern, not schema) |
-| Consent management | DPDP Act 2023, §4/6/8 | [meity.gov.in DPDP Act text](https://www.meity.gov.in/static/uploads/2024/06/2bf1f0e9f04e6fb4f8fef35e82c42aa5.pdf) | `consent` table, §4.9 |
-| Right to erasure | DPDP Act 2023, §12 | [dpdpa.com §8](https://www.dpdpa.com/dpdpa2023/chapter-2/section8.html) | Erasure workflow: soft-delete `identity` (tombstone traits), hard-delete after legal retention window, cascade credential/session/consent deletion |
-| Breach notification (≤72h detailed report) | DPDP Act 2023 §8(6); DPDP Rules 2025 | [dpdpa.com §16](https://www.dpdpa.com/dpdpa2023/chapter-4/section16.html); [DPDP Rules 2025 PDF](https://www.dpdpa.com/DPDP_Rules_2025_English_only.pdf) | Incident-response runbook + Audit Svc timestamp trail as evidence source |
-| Data localization (payment data) | RBI circular DPSS.CO.OD.No.2785/06.08.005/2017-18 | [rbi.org.in FAQ](https://www.rbi.org.in/commonman/english/scripts/FAQs.aspx?Id=2995) | All Postgres/Redis/Kafka/KMS deployed in India regions only (Mumbai/Hyderabad); no foreign-region replicas, ever |
-| Cross-border transfer | DPDP Act 2023 §16 | [dpdpa.com §16](https://www.dpdpa.com/dpdpa2023/chapter-4/section16.html) | N/A by design (data never leaves India) — simplifies compliance vs relying on the Act's negative-list exception |
+Each phase below is scoped to be handed to an AI coding agent as a self-contained epic, with explicit entry/exit criteria so a coding agent (or a human reviewer) can verify completion without re-deriving intent.
 
----
+**Phase 0 — Foundations**
+Entry: none. Exit: multi-region CockroachDB cluster live in India-designated super-regions; Hydra deployed against `hydra` database; Permify deployed against `permify` database; base Terraform/IaC for the public-cloud India-region environment with encryption, network isolation, and logging enabled by default; CI/CD scaffolding.
 
-## 8. Observability (per blueprint §5)
+**Phase 1 — Core Identity Service**
+Entry: Phase 0 done. Exit: `idp` database schema (§3) migrated; identity CRUD; credential storage abstraction (password hash only — no OTP/TOTP secret fields exist in code); flow engine skeleton for login/registration/recovery/verification/settings with hook extension points wired but no external providers yet; tenant + tenant_config CRUD.
 
-- **Tracing:** OpenTelemetry SDK in every service, W3C Trace Context propagated through the API Gateway → all downstream calls including the synchronous KYC webhook; exported to Jaeger (self-hosted, India region — trace data may contain PII, so it's in-scope for data localization too).
-- **Metrics:** Prometheus scrape per service; business metrics (login success/fail rate, MFA challenge latency, step-up trigger rate per risk level) alongside system metrics (DB pool saturation, Redis memory, Kafka consumer lag) — Grafana dashboards per tenant + aggregate.
-- **Logging:** structured JSON; a PII-masking middleware runs before any log line leaves the process boundary (mask email/phone/account-number patterns) — required before forwarding to SIEM (Splunk/ELK), since logs are otherwise a DPDP-scope data leak vector.
+**Phase 2 — Hydra integration**
+Entry: Phase 1 done. Exit: Identity Service implements Hydra's login/consent challenge-accept-reject contract end to end; OAuth client management surfaced per tenant; a full login → consent → token round trip works for at least one native (non-migrated) test tenant.
 
----
+**Phase 3 — Permify integration**
+Entry: Phase 1 done (can run parallel to Phase 2). Exit: Permify schema (entities/relations per §3) deployed; relation-tuple writes triggered on identity/role/org changes; `Check()` enforcement wired into the API Gateway/BFF for at least one protected resource per tenant type.
 
-## 9. Phased roadmap
+**Phase 4 — External adapter integration**
+Entry: Phase 1 done. Exit: OTP/TOTP/Passkey/Notification adapter interfaces implemented against the bank's actual enterprise services (sandbox/staging endpoints first); per-tenant config resolution proven for at least two tenants pointing at different provider configs; adapters fail closed with no native fallback.
 
-1. **Phase 0 — Foundations:** `tenant`, `identity`, `credential` tables; Identity Service + Credential Service; Postgres RLS scaffolding; Redis session store skeleton.
-2. **Phase 1 — Core auth:** password + OTP login/registration flows; e-KYC synchronous webhook hook; Session Service; Auth-Delegate Adapter v1 (login-provider contract against the in-house AS, using its real challenge/accept/reject API).
-3. **Phase 2 — MFA & step-up:** TOTP, WebAuthn credential types; risk_signal + MFA/Risk Service v1 (rule-based, no ML); step-up flow trees per tenant.
-4. **Phase 3 — Multi-tenancy & federation:** dedicated-schema tenant provisioning; SAML2 + OIDC Identity Brokering; claim dialects/mapping; per-tenant branding.
-5. **Phase 4 — Compliance hardening:** hash-chained WORM audit log; consent management + DPDP erasure workflow; HSM/KMS integration for `secret_data` envelope encryption; PII log-masking middleware.
-6. **Phase 5 — Scale-out:** Kafka event mesh to fraud/SIEM consumers; multi-region active-active (Mumbai + Hyderabad) with Patroni + regional Redis; full OpenTelemetry/Prometheus/Grafana rollout; load testing to 99.99% SLA target.
+**Phase 5 — Kratos migration bridge**
+Entry: Phases 1–4 done. Exit: federation bridge (§9 phase 2) live for a pilot employee cohort with zero behavior change observed; credential import job tested idempotently against a Kratos staging export.
+
+**Phase 6 — Pilot cutover**
+Entry: Phase 5 done. Exit: one low-risk employee batch fully migrated (dual-write verified, then cutover); all §10 fitness functions passing for that batch.
+
+**Phase 7 — Progressive cutover, all tenant types**
+Entry: Phase 6 done. Exit: remaining employee batches, then retail, then corporate, then partner, then vendor/merchant/NTB tenants migrated in that order (ascending blast-radius sensitivity is deliberately not the same as ascending regulatory sensitivity — retail is high-volume but well-understood; corporate/partner carry the more complex entitlement graphs and should follow, not lead).
+
+**Phase 8 — Compliance hardening**
+Entry: can start once Phase 3 and Phase 4 are stable, does not need to wait for full cutover. Exit: WORM audit trail finalized; DPDP consent ledger live; penetration test completed; RBI compliance review completed against the current (re-verified, not assumed) primary regulatory text; DR drill executed against the actual RTO/RPO figures supplied by compliance.
+
+**Phase 9 — Kratos decommission**
+Entry: Phase 7 fully complete and the compliance-mandated retention period elapsed. Exit: Kratos infrastructure decommissioned.
 
 ---
 
-## 10. Consolidated references
+## 10. Open questions requiring bank input before implementation starts
 
-**Ory Kratos** — https://www.ory.com/docs/kratos/self-service · identity schema: https://www.ory.com/docs/kratos/manage-identities/identity-schema · credentials: https://www.ory.com/docs/kratos/concepts/credentials · sessions: https://www.ory.com/docs/kratos/session-management/overview · hooks: https://www.ory.com/docs/kratos/hooks/configure-hooks · production guide: https://www.ory.com/docs/kratos/guides/production · source: https://github.com/ory/kratos
+1. **Cloud provider and exact India regions.** The architecture assumes a public cloud provider with 3+ India regions to satisfy CockroachDB's `REGION` survival goal — confirm which provider and which regions are actually available/approved.
+2. **Exact RBI RTO/RPO figures** for this system's criticality tier — not asserted in this document (see §8).
+3. **Precise current statutory basis and applicability scope** of the RBI IT-outsourcing Master Directions (2023 and 2025 successor) for this specific bank entity type — the specific claim checked in this research round was refuted (see §11) and needs a fresh legal/compliance verification pass, not an engineering assumption.
+4. **Whether any current Kratos-integrated internal system requires SAML2** (not just OIDC) — the blueprint deliberately does not commit to building a SAML bridge until this is confirmed against the actual internal-app inventory.
+5. **Permify/FusionAuth roadmap risk.** Permify was acquired by FusionAuth (announced Nov 2025); core Permify and its ReBAC schema language are unchanged as of this research snapshot, but pricing/hosting/tenancy features under FusionAuth ownership should be re-checked before long-term commitment.
+6. **Tenant-count / blast-radius guidance at bank scale.** No published Permify guidance was found on tenant-count scaling limits or per-tenant blast-radius containment for the highest-sensitivity tenant class (large corporate/B2B) — worth a direct question to Permify/FusionAuth before finalizing whether row-level tenancy is sufficient for that segment or whether an additional isolation mechanism is warranted for it specifically.
 
-**Ory Hydra (auth-delegation pattern, §1.4/§3.6/§4.6)** — login/consent flow: https://www.ory.com/docs/oauth2-oidc/custom-login-consent/flow · "OAuth2 server without user management": https://github.com/ory/hydra · security architecture: https://www.ory.com/docs/hydra/security-architecture
+---
 
-**WSO2 Identity Server** — multitenancy: https://is.docs.wso2.com/en/6.1.0/references/concepts/introduction-to-multitenancy/ · claim dialects: https://is.docs.wso2.com/en/5.10.0/learn/configuring-claim-dialects/ · adaptive auth: https://is.docs.wso2.com/en/6.0.0/references/adaptive-authentication-js-api-reference/ · token persistence: https://is.docs.wso2.com/en/6.1.0/deploy/token-persistence/ · multi-region: https://wso2.com/library/articles/2018/04/multi-region-deployment-for-wso2-identity-server-part-1/
+## 11. Verification confidence & explicit exclusions
 
-**Ping Identity** — authentication policies: https://docs.pingidentity.com/pingfederate/13.0/administrators_reference_guide/pf_authentication_policies.html · PingOne Protect risk: https://docs.pingidentity.com/pingone/threat_protection_using_pingone_protect/p1_protect_risk_evaluations.html · MFA devices: https://docs.pingidentity.com/pingone/directory/p1_manage_a_users_devices.html · environments/populations: https://docs.pingidentity.com/pingone/directory/p1_groups_vs_populations.html · JWKS rotation: https://docs.pingidentity.com/pingfederate/13.0/administrators_reference_guide/pf_jwks_endpoint.html · DaVinci Flow Conductor: https://docs.pingidentity.com/connectors/flow_conductor_connector.html
+All Ory Hydra, Permify, and CockroachDB technical claims in this document were independently verified 2-1 or 3-0 against primary vendor documentation (GitHub repos, official docs, RFCs) during the research pass, plus independent third-party corroboration. RBI regulatory claims are confirmed at the level of the Directions' existence, dates, and the specific clauses cited in §4 and the blueprint's §4 — but **two adjacent, more specific claims were checked and refuted** and must not be treated as verified:
 
-**Keycloak** — core concepts: https://www.keycloak.org/docs/latest/server_admin/index.html · credential model: https://www.keycloak.org/docs-api/latest/javadocs/org/keycloak/credential/hash/PasswordHashProvider.html · Argon2 default: https://www.keycloak.org/2024/06/keycloak-2500-released · flows: https://github.com/keycloak/keycloak/blob/main/docs/documentation/server_admin/topics/authentication/flows.adoc · caching/HA: https://www.keycloak.org/server/caching
+- ❌ "The 2023 IT Governance Master Direction dedicates a numbered Chapter IV to cyber-incident/VAPT requirements" — refuted 1-2.
+- ❌ "The 2023 Outsourcing Master Direction's legal basis is specifically Section 35A of the Banking Regulation Act, 1949, with applicability to commercial banks, UCBs, NBFCs, CICs, and AIFIs" — refuted 1-2.
 
-**Standards** — OAuth 2.0: RFC 6749 · OpenID Connect: https://openid.net/specs/openid-connect-core-1_0.html · WebAuthn: https://www.w3.org/TR/webauthn-3/
+Both refuted claims are adjacent to confirmed ones (the Directions themselves, their dates, and their substantive data-separation/cloud-policy content are confirmed) — the refutation is about a specific structural/legal detail layered on top, not the Directions' existence. Treat any statement about exact chapter numbering or precise statutory basis as **unverified** until the bank's compliance/legal team re-checks it against the current primary RBI text.
 
-**RBI** — Digital Payment Security Controls MD: https://rbidocs.rbi.org.in/rdocs/notification/PDFs/MD7493544C24B5FC47D0AB12798C61CDB56F.PDF · IT Governance MD: https://www.rbi.org.in/Scripts/BS_ViewMasDirections.aspx?id=12562 · Cyber Security Framework 2016: https://www.rbi.org.in/commonman/Upload/English/Notification/PDFs/NT41802062016.pdf · Data localization FAQ: https://www.rbi.org.in/commonman/english/scripts/FAQs.aspx?Id=2995
+---
 
-**DPDP** — Act 2023 text: https://www.meity.gov.in/static/uploads/2024/06/2bf1f0e9f04e6fb4f8fef35e82c42aa5.pdf · §8 (consent/breach): https://www.dpdpa.com/dpdpa2023/chapter-2/section8.html · §16 (cross-border): https://www.dpdpa.com/dpdpa2023/chapter-4/section16.html · DPDP Rules 2025: https://www.dpdpa.com/DPDP_Rules_2025_English_only.pdf
+## 12. Sources (primary unless noted)
+
+- RBI — IT Governance, Risk, Controls and Assurance Practices Directions, 2023: https://www.rbi.org.in/scripts/BS_ViewMasDirections.aspx?id=12562
+- RBI — Master Direction on Outsourcing of IT Services (2023): https://fidcindia.org.in/wp-content/uploads/2023/04/RBI-OUTSOURCING-OF-IT-SERVICES-10-04-23.pdf
+- Google Cloud — RBI India compliance mapping (secondary, vendor): https://cloud.google.com/security/compliance/rbi-india
+- Ory Hydra (GitHub, primary): https://github.com/ory/hydra
+- Ory — OAuth2/OIDC docs (primary): https://www.ory.com/docs/oauth2-oidc
+- Ory Kratos — import user accounts/identities (primary): https://www.ory.com/docs/kratos/manage-identities/import-user-accounts-identities
+- Ory Kratos — hooks configuration (primary): https://www.ory.com/docs/kratos/hooks/configure-hooks
+- Permify — ReBAC use case (primary): https://docs.permify.co/use-cases/rebac
+- Permify — multi-tenancy (primary): https://docs.permify.co/use-cases/multi-tenancy
+- CockroachDB — multi-region overview (primary): https://www.cockroachlabs.com/docs/stable/multiregion-overview
+- CockroachDB — multi-region survival goals (primary): https://www.cockroachlabs.com/docs/stable/multiregion-survival-goals
+- CockroachDB — encryption reference (primary): https://www.cockroachlabs.com/docs/stable/security-reference/encryption
+- CockroachDB — take and restore encrypted backups (primary): https://www.cockroachlabs.com/docs/stable/take-and-restore-encrypted-backups
+- One2N — building multi-tenant authorization with Permify (secondary/blog, corroborating): https://one2n.io/blog/building-multi-tenant-authorization-system-for-b2b-saas-in-go-using-permify
+- CockroachDB — Row-Level Security overview (primary, single WebSearch spot-check, not part of the original 110-agent verification pass — re-confirm before hard commitment): https://www.cockroachlabs.com/docs/stable/row-level-security
+- CockroachDB — `CREATE POLICY` reference (primary): https://www.cockroachlabs.com/docs/dev/create-policy
